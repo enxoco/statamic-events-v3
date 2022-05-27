@@ -39,6 +39,7 @@ class Events extends CollectionTag
     {
         $from = $this->params->pull('from');
         $to = $this->params->pull('to');
+        logger("Start between function");
 
         $this->loadEvents($this->params->bool('collapse_multi_days', false));
 
@@ -57,20 +58,47 @@ class Events extends CollectionTag
         $from = Carbon::parse($from)->startOfDay();
         $to = Carbon::parse($to)->endOfDay();
 
-        if ($this->params->bool('paginate')) {
-            $this->limit = $this->params->int('limit', 1);
+        $this->loadDates($from, $to);
+        
+        $dates = array_values(array_merge(
+            $this->dates->toArray()
+        ));
 
-            $this->offset = $this->params->int('offset', 0);
+        
+        $page = (int) request('page', 1);
+        $this->limit = $this->params->int('limit', 1);
 
-            $this->setOffsetForPagination();
-            $this->paginateBetween($this->events->all($from, $to));
+        $this->offset = $this->params->int('offset', 0);
 
-            return $this->outputData();
-        }
 
-        $this->loadDates($from, $to, false);
+        $this->offset = (($page - 1) * $this->limit) + $this->offset;        
+        $paginator = new LengthAwarePaginator(
+            items: $dates,
+            total: $count = count($dates),
+            perPage: $this->limit,
+            currentPage: $page
+        );
 
-        return $this->outputData();
+        $paginator
+            ->setPath(URL::makeAbsolute(URL::getCurrent()))
+            ->appends(request()->all());
+
+        $this->paginationData = [
+            'total_items'    => $count,
+            'items_per_page' => $this->limit,
+            'total_pages'    => $paginator->lastPage(),
+            'current_page'   => $paginator->currentPage(),
+            'prev_page'      => $paginator->previousPageUrl(),
+            'next_page'      => $paginator->nextPageUrl(),
+            'auto_links'     => $paginator->render(),
+            'links'          => $paginator->render(),
+        ];
+        $dates = array_slice($dates, $this->offset, $this->limit);
+        logger("Dates");
+
+        array_push($dates, array('paginate' => $this->paginationData));
+        return $dates;
+
     }
 
     public function calendar(): array
@@ -134,17 +162,20 @@ class Events extends CollectionTag
     {
         $this->loadEvents($this->params->bool('collapse_multi_days', false));
 
-        $this->loadDates(
-            $this->params->get('ignore_finished') ? Carbon::now() : Carbon::now()->startOfDay(),
-            Carbon::now()->endOfDay(),
-            false
-        );
+        $from = $this->params->get('ignore_finished') ? Carbon::now() : Carbon::now()->startOfDay();
+        $to = Carbon::now()->endOfDay();
 
-        return $this->dates->toArray();
+        $this->loadDates($from, $to);
+
+        return array_values(array_merge(
+            $this->makeEmptyDates($from, $to),
+            $this->dates->toArray()
+        ));
     }
 
     public function upcoming(): array
     {
+        logger("running upcoming");
         $this->limit = $this->params->int('limit', 1);
 
         $this->offset = $this->params->int('offset', 0);
@@ -152,40 +183,41 @@ class Events extends CollectionTag
         $this->loadEvents($this->params->bool('collapse_multi_days', false));
 
         if ($this->params->bool('paginate')) {
-            $this->setOffsetForPagination();
-            $this->paginate($this->events->upcoming($this->limit + 1, $this->offset));
 
-            return $this->outputData();
+            $this->paginate();
+        } else {
+            $this->dates = $this->events->upcoming($this->limit, $this->offset);
         }
-
-        $this->dates = $this->events->upcoming($this->limit, $this->offset);
 
         return $this->outputData();
     }
 
-    private function setOffsetForPagination(): void
-    {
-        $page = (int) request('page', 1);
-
-        $this->offset = (($page - 1) * $this->limit) + $this->offset;
-    }
-
-    protected function paginate(Collection $events): void
+    protected function paginate(): void
     {
         $this->paginated = true;
 
         $page = (int) request('page', 1);
 
+        $this->offset = (($page - 1) * $this->limit) + $this->offset;
+
+        if ($this->offset > $this->events->count()) {
+            $this->offset = 0;
+            $page = 1;
+        }
+
+        $events = $this->events->upcoming($this->limit + 1, $this->offset);
+
+        $count = $this->events->count();
+
         $paginator = new LengthAwarePaginator(
-            items: $events,
-            total: $count = $events->count(),
-            perPage: $this->limit,
-            currentPage: $page
+            $events,
+            $count,
+            $this->limit,
+            $page
         );
 
-        $paginator
-            ->setPath(URL::makeAbsolute(URL::getCurrent()))
-            ->appends(request()->all());
+        $paginator->setPath(URL::makeAbsolute(URL::getCurrent()));
+        $paginator->appends(request()->all());
 
         $this->paginationData = [
             'total_items'    => $count,
@@ -200,14 +232,12 @@ class Events extends CollectionTag
 
         $this->dates = $events->slice(0, $this->limit);
     }
-
-    protected function paginateBetween(Collection $events): void
+        protected function paginateBetween(Collection $events): void
     {
         $this->paginated = true;
 
         $page = (int) request('page', 1);
 
-        
         $paginator = new LengthAwarePaginator(
             items: $events,
             total: $count = $events->count(),
@@ -233,6 +263,7 @@ class Events extends CollectionTag
         $this->dates = $events->slice($this->offset, $this->limit);
     }
 
+
     protected function outputData(): array
     {
         $data = array_merge(
@@ -247,18 +278,15 @@ class Events extends CollectionTag
         return $data;
     }
 
-    private function loadDates(Carbon|string $from, Carbon|string $to, bool $groupByDate = true): void
+    private function loadDates($from, $to): void
     {
         $this->dates = $this->events
             ->all($from, $to)
-            ->when($groupByDate, function (Collection $events) {
-                return $events
-                    ->groupBy(fn ($event, $key) => $event->start_date)
-                    ->map(fn ($days, $key) => [
-                            'date' => $key,
-                            'dates' => $days->toArray(),
-                        ]);
-            });
+            ->sortBy(fn ($event, $key) => $event->start_date)
+            ->map(fn ($days, $key) => [
+                    'date' => $key,
+                    'dates' => $days->toArray(),
+                ]);
     }
 
     private function loadEvents(bool $collapseMultiDays = false)
@@ -293,20 +321,22 @@ class Events extends CollectionTag
         }
 
         $events->each(
-            fn ($event) => $this->events->add(
-                EventFactory::createFromArray(
-                    array_merge(
-                        $event->toAugmentedArray(),
-                        [
-                            'asSingleDay' => $collapseMultiDays,
-                        ]
+            function ($event) use ($collapseMultiDays) {
+                $this->events->add(
+                    EventFactory::createFromArray(
+                        array_merge(
+                            $event->toAugmentedArray(),
+                            [
+                                'asSingleDay' => $collapseMultiDays,
+                            ]
+                        )
                     )
-                )
-            )
+                );
+            }
         );
     }
 
-    private function makeEmptyDates(Carbon| string $from, Carbon|string $to): array
+    private function makeEmptyDates($from, $to): array
     {
         $dates = [];
         $currentDay = $from = Carbon::parse($from);
